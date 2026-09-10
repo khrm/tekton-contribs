@@ -1,0 +1,37 @@
+name: reviews
+
+on:
+  schedule:
+    - cron: "0 * * * *" # hourly
+  workflow_dispatch:
+    inputs:
+      org:
+        default: "tektoncd"
+      days:
+        default: "7"
+
+permissions:
+  contents: write
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run review stats
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ORG="${{ inputs.org || 'tektoncd' }}"
+          DAYS="${{ inputs.days || '7' }}"
+          ./review.sh --org "$ORG" --days "$DAYS" --format csv > reviews.csv
+          python3 scripts/render-reviews-html.py reviews.csv public/index.html --orgs "$ORG" --days "$DAYS"
+          touch public/.nojekyll
+
+      - name: Deploy to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./public
+          publish_branch: gh-pages
