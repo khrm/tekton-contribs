@@ -26,6 +26,7 @@ jobs:
           ORG="${{ inputs.org || 'tektoncd' }}"
           DAYS="${{ inputs.days || '7' }}"
           ./review.sh --org "$ORG" --days "$DAYS" --format csv > reviews.csv
+          mkdir -p public
           python3 scripts/render-reviews-html.py reviews.csv public/index.html --orgs "$ORG" --days "$DAYS"
           touch public/.nojekyll
 
