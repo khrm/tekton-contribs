@@ -86,18 +86,22 @@ fetch_pages() {
         local query
         query=$(echo "$query_template" | sed "s/__AFTER__/$after/g" | sed "s/__SINCE__/$SINCE/g")
 
-        result=$(gh api graphql -f query="$query" 2>&1)
+        result=$(gh api graphql -f query="$query" 2>&1 || true)
 
-        err=$(echo "$result" | jq -r '.errors[0].message // empty' 2>/dev/null)
-        if [ -n "$err" ]; then
-            >&2 echo "GraphQL error on page $page: $err"
+        if ! echo "$result" | jq -e '.data.search' >/dev/null 2>&1; then
+            err=$(echo "$result" | jq -r '.errors[0].message // empty' 2>/dev/null || true)
+            if [ -n "$err" ]; then
+                >&2 echo "GraphQL error on page $page: $err"
+            else
+                >&2 echo "API/non-JSON error on page $page: $(echo "$result" | head -c 500 | tr '\n' ' ')"
+            fi
             break
         fi
 
-        echo "$result" | jq -r "$jq_filter"
+        echo "$result" | jq -r --arg since "$SINCE" "$jq_filter"
 
-        has_next=$(echo "$result" | jq -r '.data.search.pageInfo.hasNextPage')
-        cursor=$(echo "$result" | jq -r '.data.search.pageInfo.endCursor')
+        has_next=$(echo "$result" | jq -r '.data.search.pageInfo.hasNextPage // false')
+        cursor=$(echo "$result" | jq -r '.data.search.pageInfo.endCursor // empty')
 
         >&2 echo "  Page $page done"
         page=$((page + 1))
@@ -117,8 +121,9 @@ for org in "${ORGS[@]}"; do
           ... on PullRequest {
             number
             repository { nameWithOwner }
-            reviews(first: 100) {
-              nodes { author { login } }
+            reviews(last: 100) {
+              totalCount
+              nodes { author { login } submittedAt }
             }
           }
         }
@@ -128,8 +133,11 @@ for org in "${ORGS[@]}"; do
     REVIEW_JQ='.data.search.nodes[] |
       .repository.nameWithOwner as $repo |
       .number as $pr |
-      .reviews.nodes[] |
-      "\(.author.login)\t\($repo)#\($pr)"'
+      (.reviews | select(.totalCount > 100) | "truncated reviews for \($repo)#\($pr): \(.totalCount)" | debug | empty),
+      (.reviews.nodes[] |
+      select(.author != null and .author.login != null) |
+      select(.submittedAt != null and .submittedAt >= $since) |
+      "\(.author.login)\t\($repo)#\($pr)")'
 
     fetch_pages "$REVIEW_QUERY" "$REVIEW_JQ" >> "$REVIEWS_FILE"
 
@@ -141,11 +149,13 @@ for org in "${ORGS[@]}"; do
           ... on PullRequest {
             number
             repository { nameWithOwner }
-            reviews(first: 50) {
+            # capped at last 100 reviews / 75 comments per review to stay under 500k node cap, paginate nested connections if truncation warning fires
+            reviews(last: 100) {
+              totalCount
               nodes {
-                author { login }
-                comments(first: 50) {
+                comments(last: 75) {
                   totalCount
+                  nodes { author { login } createdAt }
                 }
               }
             }
@@ -155,8 +165,15 @@ for org in "${ORGS[@]}"; do
     }'
 
     COMMENTS_JQ='.data.search.nodes[] |
-      .reviews.nodes[] |
-      "\(.author.login)\t\(.comments.totalCount)"'
+      .repository.nameWithOwner as $repo |
+      .number as $pr |
+      (.reviews | select(.totalCount > 100) | "truncated reviews for \($repo)#\($pr): \(.totalCount)" | debug | empty),
+      (.reviews.nodes[] |
+      (.comments | select(.totalCount > 75) | "truncated comments for \($repo)#\($pr): \(.totalCount)" | debug | empty),
+      (.comments.nodes[] |
+      select(.author != null and .author.login != null) |
+      select(.createdAt != null and .createdAt >= $since) |
+      "\(.author.login)\t1"))'
 
     fetch_pages "$COMMENTS_QUERY" "$COMMENTS_JQ" >> "$COMMENTS_FILE"
 done
