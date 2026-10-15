@@ -3,11 +3,13 @@
 # for all PRs in one or more GitHub orgs updated within a given time range.
 #
 # Usage:
-#   ./github-review-stats.sh                              # tektoncd, last 7 days
-#   ./github-review-stats.sh --org tektoncd --days 14
-#   ./github-review-stats.sh --org tektoncd --org openshift-pipelines
-#   ./github-review-stats.sh --org tektoncd --days 30 --format csv
-#   ./github-review-stats.sh --org tektoncd --format md
+#   ./review.sh                              # tektoncd + shipwright-io, last 7 days
+#   ./review.sh --org tektoncd --days 14
+#   ./review.sh --org tektoncd --org shipwright-io
+#   ./review.sh --org tektoncd,shipwright-io,another-org
+#   REVIEW_ORGS="org1,org2" ./review.sh      # override default orgs
+#   ./review.sh --org tektoncd --days 30 --format csv
+#   ./review.sh --org tektoncd --format md
 #
 # Requires: gh (GitHub CLI), jq
 
@@ -16,6 +18,7 @@ set -euo pipefail
 DAYS=7
 FORMAT="tsv"
 ORGS=()
+DEFAULT_ORGS="tektoncd,shipwright-io"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -50,8 +53,19 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ${#ORGS[@]} -eq 0 ]]; then
-    ORGS=("tektoncd")
+    ORGS=("${REVIEW_ORGS:-$DEFAULT_ORGS}")
 fi
+
+# Allow comma-separated values (e.g. --org a,b) and drop duplicates
+_orgs=()
+for entry in "${ORGS[@]}"; do
+    IFS=',' read -ra parts <<< "$entry"
+    for p in "${parts[@]}"; do
+        [[ -z "$p" ]] && continue
+        [[ " ${_orgs[*]-} " == *" $p "* ]] || _orgs+=("$p")
+    done
+done
+ORGS=("${_orgs[@]}")
 
 for org in "${ORGS[@]}"; do
     if [[ ! "$org" =~ ^[a-zA-Z0-9._-]+$ ]]; then
