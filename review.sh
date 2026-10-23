@@ -3,7 +3,7 @@
 # for all PRs in one or more GitHub orgs updated within a given time range.
 #
 # Usage:
-#   ./review.sh                              # tektoncd + shipwright-io, last 7 days
+#   ./review.sh    # tektoncd + shipwright-io + openshift-pipelines + redhat-openshift-builds, last 7 days
 #   ./review.sh --org tektoncd --days 14
 #   ./review.sh --org tektoncd --org shipwright-io
 #   ./review.sh --org tektoncd,shipwright-io,another-org
@@ -18,7 +18,7 @@ set -euo pipefail
 DAYS=7
 FORMAT="tsv"
 ORGS=()
-DEFAULT_ORGS="tektoncd,shipwright-io"
+DEFAULT_ORGS="tektoncd,shipwright-io,openshift-pipelines,redhat-openshift-builds"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
