@@ -10,6 +10,8 @@
 #   REVIEW_ORGS="org1,org2" ./review.sh      # override default orgs
 #   ./review.sh --org tektoncd --days 30 --format csv
 #   ./review.sh --org tektoncd --format md
+#   ./review.sh --exclude-author my-bot      # replace default excluded authors
+#   REVIEW_EXCLUDE_AUTHORS="bot1,app/dependabot" ./review.sh  # or via env ("" to disable)
 #
 # Requires: gh (GitHub CLI), jq
 
@@ -18,26 +20,25 @@ set -euo pipefail
 DAYS=7
 FORMAT="tsv"
 ORGS=()
+EXCLUDE=()
+
 DEFAULT_ORGS="tektoncd,shipwright-io,openshift-pipelines,redhat-openshift-builds"
+DEFAULT_EXCLUDE_AUTHORS="openshift-pipelines-bot,app/red-hat-konflux-kflux-prd-rh02,app/github-actions,app/pipelines-as-code-ci-app"
+GITHUB_NAME='[a-zA-Z0-9._-]+'
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --org|--days|--format)
+        --org|--days|--format|--exclude-author)
             if [[ $# -lt 2 ]] || [[ "$2" == --* ]]; then
                 >&2 echo "Error: $1 requires a value"
                 exit 1
             fi
-            ;;&
-        --org)
-            ORGS+=("$2")
-            shift 2
-            ;;
-        --days)
-            DAYS="$2"
-            shift 2
-            ;;
-        --format)
-            FORMAT="$2"
+            case "$1" in
+                --org) ORGS+=("$2") ;;
+                --exclude-author) EXCLUDE+=("$2") ;;
+                --days) DAYS="$2" ;;
+                --format) FORMAT="$2" ;;
+            esac
             shift 2
             ;;
         --help|-h)
@@ -52,36 +53,80 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Allow comma-separated values (e.g. a,b) and drop duplicates
+normalize_list() {
+    local -n _dst=$1
+    shift
+    local -A _seen=()
+    local _tmp=() entry p parts
+    for entry in "$@"; do
+        IFS=',' read -ra parts <<< "$entry"
+        for p in "${parts[@]}"; do
+            [[ -z "$p" ]] && continue
+            [[ -n "${_seen[$p]:-}" ]] && continue
+            _seen[$p]=1
+            _tmp+=("$p")
+        done
+    done
+    _dst=("${_tmp[@]}")
+}
+
 if [[ ${#ORGS[@]} -eq 0 ]]; then
     ORGS=("${REVIEW_ORGS:-$DEFAULT_ORGS}")
 fi
-
-# Allow comma-separated values (e.g. --org a,b) and drop duplicates
-_orgs=()
-for entry in "${ORGS[@]}"; do
-    IFS=',' read -ra parts <<< "$entry"
-    for p in "${parts[@]}"; do
-        [[ -z "$p" ]] && continue
-        [[ " ${_orgs[*]-} " == *" $p "* ]] || _orgs+=("$p")
-    done
-done
-ORGS=("${_orgs[@]}")
+normalize_list ORGS "${ORGS[@]}"
 
 for org in "${ORGS[@]}"; do
-    if [[ ! "$org" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    if [[ ! "$org" =~ ^${GITHUB_NAME}$ ]]; then
         >&2 echo "Error: Invalid org name '$org'. Only alphanumeric, hyphen, underscore, and dot allowed."
         exit 1
     fi
 done
 
+if [[ ${#EXCLUDE[@]} -eq 0 ]]; then
+    EXCLUDE=("${REVIEW_EXCLUDE_AUTHORS-$DEFAULT_EXCLUDE_AUTHORS}")
+fi
+normalize_list EXCLUDE "${EXCLUDE[@]}"
+
+# Build the search-level exclusion terms and the login list used to filter
+# review/comment authors in jq (strip the app/ prefix for login matching)
+EXCLUDE_TERMS=()
+for entry in "${EXCLUDE[@]}"; do
+    if [[ ! "$entry" =~ ^${GITHUB_NAME}(/${GITHUB_NAME})?$ ]]; then
+        >&2 echo "Error: Invalid author exclusion '$entry'. Use 'login' or 'app/login'."
+        exit 1
+    fi
+    EXCLUDE_TERMS+=("-author:$entry")
+done
+# Keep the leading space in the query so __EXCLUDE__ can sit directly after
+# __SINCE__ and produce an identical query whether or not there are exclusions.
+EXCLUDE_QUERY=""
+if [[ ${#EXCLUDE_TERMS[@]} -gt 0 ]]; then
+    EXCLUDE_QUERY=" ${EXCLUDE_TERMS[*]}"
+fi
+EXCLUDED_JSON=$(printf '%s\n' "${EXCLUDE[@]}" | sed 's|^app/||' | jq -Rsc 'split("\n") | map(select(length > 0))')
+
+# jq prelude: true when the login in `.` is not excluded
+# $excluded and $l are jq variables, not shell (hence disable=SC2016)
+# shellcheck disable=SC2016
+JQ_EXCLUDED='def not_excluded: . as $l | ($excluded | index($l) | not);'
+
+# jq fragment for REVIEW_JQ: keep only review authors that are not excluded
+AUTHOR_FILTER='select(.author != null and .author.login != null) |
+      select(.author.login | not_excluded)'
+
 SINCE=$(date -d "$DAYS days ago" +%Y-%m-%d 2>/dev/null || date -v-"${DAYS}d" +%Y-%m-%d)
 
 >&2 echo "Orgs: ${ORGS[*]}"
+if [[ ${#EXCLUDE[@]} -gt 0 ]]; then
+    >&2 echo "Excluded authors: ${EXCLUDE[*]}"
+fi
 >&2 echo "Fetching PRs updated since $SINCE ..."
 
 TMPDIR=$(mktemp -d)
 REVIEWS_FILE="$TMPDIR/reviews.tsv"
 COMMENTS_FILE="$TMPDIR/comments.tsv"
+REPOS_FILE="$TMPDIR/repos.txt"
 trap 'rm -rf "$TMPDIR"' EXIT
 
 fetch_pages() {
@@ -97,8 +142,12 @@ fetch_pages() {
             after="\"$cursor\""
         fi
 
-        local query
-        query=$(echo "$query_template" | sed "s/__AFTER__/$after/g" | sed "s/__SINCE__/$SINCE/g")
+        # Substitute placeholders without sed so app/ logins (which contain
+        # slashes) cannot break the replacement.
+        local query="$query_template"
+        query=${query//__AFTER__/$after}
+        query=${query//__SINCE__/$SINCE}
+        query=${query//__EXCLUDE__/$EXCLUDE_QUERY}
 
         result=$(gh api graphql -f query="$query" 2>&1 || true)
 
@@ -112,10 +161,21 @@ fetch_pages() {
             break
         fi
 
-        echo "$result" | jq -r --arg since "$SINCE" "$jq_filter"
+        # One jq pass per page: P = pagination, R = repo name, V = review row
+        local page_out
+        page_out=$(echo "$result" | jq -r --arg since "$SINCE" --argjson excluded "$EXCLUDED_JSON" "$JQ_EXCLUDED"'
+            "P\t\(.data.search.pageInfo.hasNextPage)\t\(.data.search.pageInfo.endCursor // "")",
+            (.data.search.nodes[]?.repository.nameWithOwner // empty | "R\t" + .),
+            (('"$jq_filter"') | "V\t" + .)')
 
-        has_next=$(echo "$result" | jq -r '.data.search.pageInfo.hasNextPage // false')
-        cursor=$(echo "$result" | jq -r '.data.search.pageInfo.endCursor // empty')
+        has_next=""
+        while IFS=$'\t' read -r tag f1 f2; do
+            case "$tag" in
+                P) has_next="$f1"; cursor="$f2" ;;
+                R) echo "$f1" >> "$REPOS_FILE" ;;
+                V) printf '%s\t%s\n' "$f1" "$f2" ;;
+            esac
+        done <<< "$page_out"
 
         >&2 echo "  Page $page done"
         page=$((page + 1))
@@ -126,10 +186,31 @@ fetch_pages() {
     done
 }
 
+# Read repo names (one per line) on stdin; emit "login<TAB>1" per review comment.
+fetch_rest_comments() {
+    local repo comments_json
+    while read -r repo; do
+        [[ -n "$repo" ]] || continue
+        comments_json=$(gh api --paginate \
+            "repos/$repo/pulls/comments?since=${SINCE}T00:00:00Z&per_page=100" 2>/dev/null || true)
+        if ! echo "$comments_json" | jq -r -s --arg since "$SINCE" --argjson excluded "$EXCLUDED_JSON" "$JQ_EXCLUDED"'
+            if all(.[]; type == "array") then
+              .[][] | select(.user != null and .user.login != null) |
+              select(.user.login | not_excluded) |
+              select(.created_at != null and .created_at >= $since) |
+              "\(.user.login)\t1"
+            else
+              error("unexpected response shape")
+            end'; then
+            >&2 echo "  Failed to fetch review comments for $repo"
+        fi
+    done
+}
+
 for org in "${ORGS[@]}"; do
     >&2 echo "Fetching review events for $org..."
     REVIEW_QUERY='{
-      search(query: "org:'"$org"' is:pr updated:>__SINCE__", type: ISSUE, first: 100, after: __AFTER__) {
+      search(query: "org:'"$org"' is:pr updated:>__SINCE____EXCLUDE__", type: ISSUE, first: 100, after: __AFTER__) {
         pageInfo { hasNextPage endCursor }
         nodes {
           ... on PullRequest {
@@ -144,53 +225,29 @@ for org in "${ORGS[@]}"; do
       }
     }'
 
+    # $repo/$pr/$since are jq variables and $AUTHOR_FILTER is deliberately
+    # expanded by the shell, so SC2016 doesn't apply here
+    # shellcheck disable=SC2016
     REVIEW_JQ='.data.search.nodes[] |
       .repository.nameWithOwner as $repo |
       .number as $pr |
       (.reviews | select(.totalCount > 100) | "truncated reviews for \($repo)#\($pr): \(.totalCount)" | debug | empty),
       (.reviews.nodes[] |
-      select(.author != null and .author.login != null) |
+      '"$AUTHOR_FILTER"' |
       select(.submittedAt != null and .submittedAt >= $since) |
       "\(.author.login)\t\($repo)#\($pr)")'
 
     fetch_pages "$REVIEW_QUERY" "$REVIEW_JQ" >> "$REVIEWS_FILE"
-
-    >&2 echo "Fetching review comments for $org..."
-    COMMENTS_QUERY='{
-      search(query: "org:'"$org"' is:pr updated:>__SINCE__", type: ISSUE, first: 50, after: __AFTER__) {
-        pageInfo { hasNextPage endCursor }
-        nodes {
-          ... on PullRequest {
-            number
-            repository { nameWithOwner }
-            # capped at last 100 reviews / 75 comments per review to stay under 500k node cap, paginate nested connections if truncation warning fires
-            reviews(last: 100) {
-              totalCount
-              nodes {
-                comments(last: 75) {
-                  totalCount
-                  nodes { author { login } createdAt }
-                }
-              }
-            }
-          }
-        }
-      }
-    }'
-
-    COMMENTS_JQ='.data.search.nodes[] |
-      .repository.nameWithOwner as $repo |
-      .number as $pr |
-      (.reviews | select(.totalCount > 100) | "truncated reviews for \($repo)#\($pr): \(.totalCount)" | debug | empty),
-      (.reviews.nodes[] |
-      (.comments | select(.totalCount > 75) | "truncated comments for \($repo)#\($pr): \(.totalCount)" | debug | empty),
-      (.comments.nodes[] |
-      select(.author != null and .author.login != null) |
-      select(.createdAt != null and .createdAt >= $since) |
-      "\(.author.login)\t1"))'
-
-    fetch_pages "$COMMENTS_QUERY" "$COMMENTS_JQ" >> "$COMMENTS_FILE"
 done
+
+# GraphQL has no server-side date filter for review comments, so fetch them
+# per repository from the REST API, which supports ?since= instead of fetching
+# every review's full comment history.
+if [[ -s "$REPOS_FILE" ]]; then
+    mapfile -t REPOS < <(sort -u "$REPOS_FILE")
+    >&2 echo "Fetching review comments for ${#REPOS[@]} repos..."
+    printf '%s\n' "${REPOS[@]}" | fetch_rest_comments >> "$COMMENTS_FILE"
+fi
 
 # Compute stats
 >&2 echo "Computing stats..."

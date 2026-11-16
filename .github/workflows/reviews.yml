@@ -6,9 +6,12 @@ on:
   workflow_dispatch:
     inputs:
       org:
-        default: "tektoncd"
+        description: "Orgs to scan (empty = script defaults)"
       days:
+        description: "Days back (empty = script default)"
         default: "7"
+      exclude:
+        description: "Authors to exclude, e.g. my-bot,app/dependabot (empty = script defaults)"
 
 permissions:
   contents: write
@@ -22,10 +25,26 @@ jobs:
       - name: Run review stats
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_ORG: ${{ inputs.org }}
+          INPUT_DAYS: ${{ inputs.days }}
+          INPUT_EXCLUDE: ${{ inputs.exclude }}
         run: |
-          ORG="${{ inputs.org || 'tektoncd' }}"
-          DAYS="${{ inputs.days || '7' }}"
-          ./review.sh --org "$ORG" --days "$DAYS" --format csv > reviews.csv
+          ARGS=(--format csv)
+          if [[ -n "$INPUT_ORG" ]]; then
+            ARGS+=(--org "$INPUT_ORG")
+          fi
+          if [[ -n "$INPUT_DAYS" ]]; then
+            ARGS+=(--days "$INPUT_DAYS")
+          fi
+          if [[ -n "$INPUT_EXCLUDE" ]]; then
+            ARGS+=(--exclude-author "$INPUT_EXCLUDE")
+          fi
+
+          ./review.sh "${ARGS[@]}" > reviews.csv
+
+          # Page subtitle; mirrors review.sh's defaults when inputs are empty.
+          ORG="${INPUT_ORG:-tektoncd,shipwright-io,openshift-pipelines,redhat-openshift-builds}"
+          DAYS="${INPUT_DAYS:-7}"
           mkdir -p public
           python3 scripts/render-reviews-html.py reviews.csv public/index.html --orgs "$ORG" --days "$DAYS"
           touch public/.nojekyll
